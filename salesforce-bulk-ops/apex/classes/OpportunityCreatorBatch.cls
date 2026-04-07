@@ -1,30 +1,26 @@
-// ============================================================================
-// 02_create_opportunities.apex
-// Batch class to create Opportunity records at configurable scale.
-// Uses Database.Batchable with Iterable<Integer> to generate data.
-//
-// Usage: Paste into Developer Console > Execute Anonymous Window > Execute
-//        Monitor: Setup > Apex Jobs  OR  query AsyncApexJob
-// ============================================================================
-
-// ======================== CONFIGURATION ========================
-Integer TOTAL_OPPORTUNITIES = 500;  // Total number of Opportunities to create
-Integer BATCH_SIZE          = 200;  // Records per batch execution (max 2000, recommended 200)
-Boolean CHAIN_LINEITEMS     = false; // If true, auto-starts LineItem batch on completion
-// ===============================================================
-
-// --- Batch Class Definition ---
+/**
+ * OpportunityCreatorBatch
+ *
+ * Batch Apex class that creates Opportunity records at scale.
+ * Uses Iterable<Integer> to generate work units (no source query needed).
+ * Implements Database.Stateful to track success/failure counts across batches.
+ *
+ * Deploy: Setup > Apex Classes > New > paste this file > Save
+ * Invoke: Execute Anonymous:
+ *     Database.executeBatch(new OpportunityCreatorBatch(500, false), 200);
+ */
 public class OpportunityCreatorBatch implements Database.Batchable<Integer>, Database.Stateful {
 
     private Integer totalRecords;
+    private Integer startIndex;
     private Boolean chainLineItems;
 
-    // Stateful counters
+    // Stateful counters (survive across batch executions)
     private Integer successCount = 0;
     private Integer failureCount = 0;
     private Integer batchNumber  = 0;
 
-    // Opportunity field value pools for randomization
+    // Field value pools for varied data
     private static final List<String> STAGE_NAMES = new List<String>{
         'Prospecting', 'Qualification', 'Needs Analysis',
         'Value Proposition', 'Perception Analysis',
@@ -42,37 +38,47 @@ public class OpportunityCreatorBatch implements Database.Batchable<Integer>, Dat
         'Existing Customer - Downgrade', 'New Customer'
     };
 
+    /**
+     * @param totalRecords   Total number of Opportunities to create
+     * @param chainLineItems If true, auto-starts LineItemCreatorBatch on completion
+     */
     public OpportunityCreatorBatch(Integer totalRecords, Boolean chainLineItems) {
-        this.totalRecords = totalRecords;
-        this.chainLineItems = chainLineItems;
+        this(totalRecords, chainLineItems, 1);
     }
 
-    // start(): Generate a list of integers as work units
+    /**
+     * @param totalRecords   Total number of Opportunities to create
+     * @param chainLineItems If true, auto-starts LineItemCreatorBatch on completion
+     * @param startIndex     Starting index for record naming (for multi-run scenarios)
+     */
+    public OpportunityCreatorBatch(Integer totalRecords, Boolean chainLineItems, Integer startIndex) {
+        this.totalRecords = totalRecords;
+        this.chainLineItems = chainLineItems;
+        this.startIndex = startIndex;
+    }
+
     public Iterable<Integer> start(Database.BatchableContext bc) {
         List<Integer> workUnits = new List<Integer>();
-        for (Integer i = 1; i <= totalRecords; i++) {
+        for (Integer i = startIndex; i < startIndex + totalRecords; i++) {
             workUnits.add(i);
         }
-        System.debug('OpportunityCreatorBatch started. Total records to create: ' + totalRecords);
+        System.debug('OpportunityCreatorBatch started. Records to create: ' + totalRecords +
+                      ', starting at index: ' + startIndex);
         return workUnits;
     }
 
-    // execute(): Create Opportunity records for this batch
     public void execute(Database.BatchableContext bc, List<Integer> scope) {
         batchNumber++;
         List<Opportunity> opps = new List<Opportunity>();
 
         for (Integer idx : scope) {
-            // Generate varied but deterministic data based on index
             Integer stageIdx  = Math.mod(idx, STAGE_NAMES.size());
             Integer sourceIdx = Math.mod(idx, LEAD_SOURCES.size());
             Integer typeIdx   = Math.mod(idx, TYPES.size());
 
-            // CloseDate: spread across next 12 months
             Integer daysOffset = Math.mod(idx * 7, 365);
             Date closeDate = Date.today().addDays(daysOffset);
 
-            // Amount: varied range $1,000 - $500,000
             Decimal amount = 1000 + Math.mod(idx * 1337, 499000);
 
             opps.add(new Opportunity(
@@ -80,10 +86,10 @@ public class OpportunityCreatorBatch implements Database.Batchable<Integer>, Dat
                 StageName   = STAGE_NAMES[stageIdx],
                 CloseDate   = closeDate,
                 Amount      = amount,
-                Probability = Math.mod(idx * 13, 101),  // 0-100
+                Probability = Math.mod(idx * 13, 101),
                 LeadSource  = LEAD_SOURCES[sourceIdx],
                 Type        = TYPES[typeIdx],
-                Description = 'Bulk test opportunity #' + idx + ' created via Apex batch'
+                Description = 'Bulk test opportunity #' + idx
             ));
         }
 
@@ -101,11 +107,10 @@ public class OpportunityCreatorBatch implements Database.Batchable<Integer>, Dat
             }
         }
 
-        System.debug('Batch #' + batchNumber + ' complete. Scope size: ' + scope.size() +
-                      ' | Running total - Success: ' + successCount + ', Failed: ' + failureCount);
+        System.debug('Batch #' + batchNumber + ' | scope: ' + scope.size() +
+                      ' | running total — success: ' + successCount + ', failed: ' + failureCount);
     }
 
-    // finish(): Log final results, optionally chain LineItem batch
     public void finish(Database.BatchableContext bc) {
         System.debug('=== OPPORTUNITY CREATION COMPLETE ===');
         System.debug('Total Success: ' + successCount);
@@ -114,18 +119,8 @@ public class OpportunityCreatorBatch implements Database.Batchable<Integer>, Dat
         System.debug('=====================================');
 
         if (chainLineItems && successCount > 0) {
-            System.debug('Chaining OpportunityLineItem batch...');
-            // NOTE: To auto-chain, the LineItemCreatorBatch class must already
-            // be deployed. See 03_create_lineitems.apex.
-            // Uncomment the line below after deploying the LineItem batch class:
-            // Database.executeBatch(new LineItemCreatorBatch(3), 200);
+            System.debug('Auto-chaining LineItemCreatorBatch (3 items per opp, batch size 200)...');
+            Database.executeBatch(new LineItemCreatorBatch(3), 200);
         }
     }
 }
-
-// --- Execute the batch ---
-System.debug('Submitting OpportunityCreatorBatch: ' + TOTAL_OPPORTUNITIES + ' records, batch size: ' + BATCH_SIZE);
-Id batchJobId = Database.executeBatch(new OpportunityCreatorBatch(TOTAL_OPPORTUNITIES, CHAIN_LINEITEMS), BATCH_SIZE);
-System.debug('Batch Job submitted. Job ID: ' + batchJobId);
-System.debug('Monitor at: Setup > Environments > Jobs > Apex Jobs');
-System.debug('Or run: SELECT Id, Status, JobItemsProcessed, TotalJobItems, NumberOfErrors FROM AsyncApexJob WHERE Id = \'' + batchJobId + '\'');

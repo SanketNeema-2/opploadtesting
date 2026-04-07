@@ -173,69 +173,96 @@ Step 3: Delete Products (optional cleanup)
 
 ---
 
-## 5. Approach A: Apex Batch Scripts (Developer Console)
+## 5. Approach A: Apex Batch Classes (Developer Console)
 
-### Overview
+### Two-Step Pattern: Deploy Class, Then Invoke
 
-Four Apex scripts designed to run in Developer Console's Anonymous Apex window.
-All record counts are configurable via constants at the top of each script.
+Anonymous Apex (Execute Anonymous) **cannot define classes** that implement
+interfaces like `Database.Batchable`. This is a Salesforce platform constraint.
 
-### Script Inventory
+The solution is a two-step approach:
 
-| Script | Purpose | Execution Mode |
-|--------|---------|---------------|
-| `01_create_products.apex` | Create Product2 + PricebookEntry records | Synchronous (small count) |
-| `02_create_opportunities.apex` | Batch create Opportunities | Asynchronous (Database.Batchable) |
-| `03_create_lineitems.apex` | Batch create OpportunityLineItems | Asynchronous (Database.Batchable) |
-| `04_delete_opportunities.apex` | Batch delete Opportunities (cascades to LineItems) | Asynchronous (Database.Batchable) |
+1. **Deploy batch classes** to the org (one-time setup)
+2. **Invoke them** from Execute Anonymous with configurable parameters
+
+### Step 1: Deploy Batch Classes (One-Time)
+
+Deploy each `.cls` file from `apex/classes/` to your org:
+
+```
+Setup > Apex Classes > New > paste file contents > Save
+```
+
+| Class File | Purpose |
+|------------|---------|
+| `OpportunityCreatorBatch.cls` | Creates Opportunity records at scale |
+| `LineItemCreatorBatch.cls` | Creates OpportunityLineItems for existing Opps |
+| `OpportunityDeletionBatch.cls` | Deletes BulkTest Opportunities (cascade deletes LineItems) |
+| `ProductCleanupBatch.cls` | Deletes BulkTest Products + PricebookEntries |
+
+### Step 2: Run Invoker Scripts (On-Demand)
+
+Paste the corresponding script from `apex/scripts/` into Execute Anonymous:
+
+| Script | Purpose | Invokes |
+|--------|---------|---------|
+| `01_create_products.apex` | Create Products + PricebookEntries | Direct DML (small count) |
+| `02_run_create_opportunities.apex` | Create Opportunities | `OpportunityCreatorBatch` |
+| `03_run_create_lineitems.apex` | Create LineItems | `LineItemCreatorBatch` |
+| `04_run_delete.apex` | Delete all BulkTest data | `OpportunityDeletionBatch` + `ProductCleanupBatch` |
 
 ### Batch Design Pattern
 
-All batch classes follow this pattern:
+All batch classes implement `Database.Batchable` + `Database.Stateful`:
 
 ```apex
 public class OpportunityCreatorBatch implements Database.Batchable<Integer>,
                                                  Database.Stateful {
-    // Configuration
-    private Integer totalRecords;
-    private Integer batchSize;
-
-    // Stateful counters (survive across batches)
-    private Integer successCount = 0;
+    private Integer successCount = 0;  // Survives across batches
     private Integer failureCount = 0;
 
     public Iterable<Integer> start(Database.BatchableContext bc) {
-        // Return a list of integers as "work units"
-        // Each integer represents one record to create
+        // Return work units (integers 1..N)
     }
 
     public void execute(Database.BatchableContext bc, List<Integer> scope) {
-        // Create records for this batch
-        // Use Database.insert(records, false) for partial success
+        // Create records for this batch, scope size = BATCH_SIZE
+        List<Database.SaveResult> results = Database.insert(opps, false);
     }
 
     public void finish(Database.BatchableContext bc) {
-        // Log results
-        System.debug('Success: ' + successCount + ', Failed: ' + failureCount);
+        // Log totals, optionally chain next batch
     }
 }
 ```
 
 Key design decisions:
-- `Database.Stateful` preserves counters across batches
-- `Database.insert(records, false)` allows partial success (allOrNone=false)
-- Batch size defaults to 200 (safe margin under the 10,000 DML row limit)
-- Uses `Iterable<Integer>` instead of `QueryLocator` since we're generating data, not querying
+- **`Database.Stateful`**: Preserves success/failure counters across batches
+- **`Database.insert(records, false)`**: Partial success (allOrNone=false)
+- **Batch size 200** (default): Safe margin under 10,000 DML row governor limit
+- **Chaining**: `OpportunityCreatorBatch` can auto-chain `LineItemCreatorBatch`
+- **`QueryLocator`**: Used by LineItem and Deletion batches to iterate existing records
+- **`Iterable<Integer>`**: Used by OpportunityCreator to generate records without a source query
 
-### Chaining Strategy
+### Scalability (No Record Limit)
 
-OpportunityLineItems depend on Opportunity IDs existing first. Two options:
+Unlike Anonymous Apex DML (capped at 10,000 rows), batch classes process records
+across **multiple transactions**. Each batch execution gets its own governor limits:
 
-1. **Manual chaining**: Run script 02, wait for completion, then run script 03
-2. **Auto-chaining**: Script 02's `finish()` method invokes script 03 via `Database.executeBatch()`
+```
+500,000 Opportunities / 200 per batch = 2,500 batch executions
+Each execution: independent 10,000 DML row limit, 60s CPU, 12 MB heap
+```
 
-The scripts support both. Auto-chaining is disabled by default to give you
-control over each step.
+For even larger volumes, adjust `START_INDEX` across multiple batch submissions:
+
+```apex
+// Run 1: create Opps 1 - 500,000
+Database.executeBatch(new OpportunityCreatorBatch(500000, false, 1), 200);
+
+// Run 2: create Opps 500,001 - 1,000,000
+Database.executeBatch(new OpportunityCreatorBatch(500000, false, 500001), 200);
+```
 
 ### Monitoring Batch Jobs
 
@@ -253,6 +280,14 @@ WHERE JobType = 'BatchApex'
 ORDER BY CreatedDate DESC
 LIMIT 10
 ```
+
+### Execution Order
+
+1. **Deploy** all 4 `.cls` files (one-time)
+2. Run `01_create_products.apex` (synchronous, creates Products + PricebookEntries)
+3. Run `02_run_create_opportunities.apex` -- wait for batch to complete
+4. Run `03_run_create_lineitems.apex` -- wait for batch to complete
+5. When cleanup needed: Run `04_run_delete.apex`
 
 ---
 
