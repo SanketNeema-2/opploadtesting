@@ -119,8 +119,10 @@ public class OpportunityCreatorBatch implements Database.Batchable<Integer>, Dat
         System.debug('=====================================');
 
         if (chainLineItems && successCount > 0) {
-            System.debug('Auto-chaining LineItemCreatorBatch (3 items per opp, batch size 200)...');
-            Database.executeBatch(new LineItemCreatorBatch(3), 200);
+            Integer endIndex = startIndex + totalRecords - 1;
+            System.debug('Auto-chaining LineItemCreatorBatch (3 items per opp, range: ' +
+                          startIndex + ' to ' + endIndex + ')...');
+            Database.executeBatch(new LineItemCreatorBatch(3, startIndex, endIndex), 200);
         }
     }
 }

@@ -5,19 +5,32 @@
  * BulkTest Opportunities. Uses QueryLocator to iterate over Opportunities
  * and creates N line items per Opportunity.
  *
+ * Supports two modes:
+ *   - Unscoped: processes ALL BulkTest_Opp_% Opportunities
+ *   - Scoped:   processes only Opportunities in a specific index range
+ *               (used when chained from OpportunityCreatorBatch to avoid
+ *               duplicating line items on Opportunities from previous runs)
+ *
  * Prerequisites:
  *   - Products + PricebookEntries exist (01_create_products.apex)
  *   - Opportunities exist (OpportunityCreatorBatch)
  *
  * Deploy: Setup > Apex Classes > New > paste this file > Save
  * Invoke: Execute Anonymous:
+ *     // All BulkTest Opportunities:
  *     Database.executeBatch(new LineItemCreatorBatch(3), 200);
+ *     // Scoped to a specific range (e.g., Opps 501-1000):
+ *     Database.executeBatch(new LineItemCreatorBatch(3, 501, 1000), 200);
  */
 public class LineItemCreatorBatch implements Database.Batchable<SObject>, Database.Stateful {
 
     private Integer lineItemsPerOpp;
     private List<PricebookEntry> pricebookEntries;
     private Id stdPricebookId;
+
+    // Scoping: when set, only process Opportunities in this name range
+    private String nameFrom;  // e.g. 'BulkTest_Opp_000501'
+    private String nameTo;    // e.g. 'BulkTest_Opp_001000'
 
     // Stateful counters
     private Integer successCount  = 0;
@@ -26,10 +39,28 @@ public class LineItemCreatorBatch implements Database.Batchable<SObject>, Databa
     private Integer oppsProcessed = 0;
 
     /**
+     * Unscoped constructor — creates line items for ALL BulkTest Opportunities.
      * @param lineItemsPerOpp Number of OpportunityLineItems to create per Opportunity
      */
     public LineItemCreatorBatch(Integer lineItemsPerOpp) {
         this.lineItemsPerOpp = lineItemsPerOpp;
+        this.nameFrom = null;
+        this.nameTo = null;
+    }
+
+    /**
+     * Scoped constructor — creates line items only for Opportunities in the given index range.
+     * Used by OpportunityCreatorBatch when chaining, to avoid duplicating line items
+     * on Opportunities from previous runs.
+     *
+     * @param lineItemsPerOpp Number of OpportunityLineItems to create per Opportunity
+     * @param startIndex      Starting Opportunity index (maps to BulkTest_Opp_XXXXXX naming)
+     * @param endIndex        Ending Opportunity index (inclusive)
+     */
+    public LineItemCreatorBatch(Integer lineItemsPerOpp, Integer startIndex, Integer endIndex) {
+        this.lineItemsPerOpp = lineItemsPerOpp;
+        this.nameFrom = 'BulkTest_Opp_' + String.valueOf(startIndex).leftPad(6, '0');
+        this.nameTo   = 'BulkTest_Opp_' + String.valueOf(endIndex).leftPad(6, '0');
     }
 
     public Database.QueryLocator start(Database.BatchableContext bc) {
@@ -50,15 +81,26 @@ public class LineItemCreatorBatch implements Database.Batchable<SObject>, Databa
                 'No BulkTest PricebookEntries found. Run 01_create_products.apex first.');
         }
 
-        System.debug('LineItemCreatorBatch started. PricebookEntries: ' + pricebookEntries.size() +
-                      ', LineItems per Opp: ' + lineItemsPerOpp);
-
-        return Database.getQueryLocator([
-            SELECT Id, Name, Pricebook2Id
-            FROM Opportunity
-            WHERE Name LIKE 'BulkTest_Opp_%'
-            ORDER BY Name
-        ]);
+        if (nameFrom != null && nameTo != null) {
+            System.debug('LineItemCreatorBatch started (SCOPED). Range: ' + nameFrom + ' to ' + nameTo +
+                          ', PricebookEntries: ' + pricebookEntries.size() +
+                          ', LineItems per Opp: ' + lineItemsPerOpp);
+            return Database.getQueryLocator([
+                SELECT Id, Name, Pricebook2Id
+                FROM Opportunity
+                WHERE Name >= :nameFrom AND Name <= :nameTo
+                ORDER BY Name
+            ]);
+        } else {
+            System.debug('LineItemCreatorBatch started (ALL). PricebookEntries: ' + pricebookEntries.size() +
+                          ', LineItems per Opp: ' + lineItemsPerOpp);
+            return Database.getQueryLocator([
+                SELECT Id, Name, Pricebook2Id
+                FROM Opportunity
+                WHERE Name LIKE 'BulkTest_Opp_%'
+                ORDER BY Name
+            ]);
+        }
     }
 
     public void execute(Database.BatchableContext bc, List<Opportunity> scope) {
@@ -126,6 +168,7 @@ public class LineItemCreatorBatch implements Database.Batchable<SObject>, Databa
 
     public void finish(Database.BatchableContext bc) {
         System.debug('=== LINE ITEM CREATION COMPLETE ===');
+        System.debug('Mode:                    ' + (nameFrom != null ? 'SCOPED (' + nameFrom + ' to ' + nameTo + ')' : 'ALL'));
         System.debug('Opportunities processed: ' + oppsProcessed);
         System.debug('LineItems per Opp:       ' + lineItemsPerOpp);
         System.debug('Total Success:           ' + successCount);

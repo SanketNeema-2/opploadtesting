@@ -240,9 +240,49 @@ Key design decisions:
 - **`Database.Stateful`**: Preserves success/failure counters across batches
 - **`Database.insert(records, false)`**: Partial success (allOrNone=false)
 - **Batch size 200** (default): Safe margin under 10,000 DML row governor limit
-- **Chaining**: `OpportunityCreatorBatch` can auto-chain `LineItemCreatorBatch`
+- **Scoped chaining**: `OpportunityCreatorBatch` can auto-chain `LineItemCreatorBatch` with a specific index range (see below)
 - **`QueryLocator`**: Used by LineItem and Deletion batches to iterate existing records
 - **`Iterable<Integer>`**: Used by OpportunityCreator to generate records without a source query
+
+### Scoped Chaining (Critical for Multi-Run Safety)
+
+When `OpportunityCreatorBatch` chains to `LineItemCreatorBatch`, it passes the
+exact `startIndex` and `endIndex` so that LineItems are only created for the
+Opportunities produced by **that specific batch run** — not all BulkTest
+Opportunities in the org.
+
+**Why this matters**: Without scoping, running a second batch starting at index
+501 with `CHAIN_LINEITEMS=true` would create duplicate LineItems on Opps 1-500
+from the previous run, because `LineItemCreatorBatch` would query all
+`BulkTest_Opp_%` Opportunities.
+
+**How it works**:
+
+```
+OpportunityCreatorBatch(totalRecords=500, chainLineItems=true, startIndex=501)
+    |
+    |  finish() computes endIndex = startIndex + totalRecords - 1 = 1000
+    |
+    v
+LineItemCreatorBatch(lineItemsPerOpp=3, startIndex=501, endIndex=1000)
+    |
+    |  start() builds query:
+    |    WHERE Name >= 'BulkTest_Opp_000501' AND Name <= 'BulkTest_Opp_001000'
+    |
+    v  (Only processes Opps 501-1000, not 1-500)
+```
+
+`LineItemCreatorBatch` supports two constructors:
+
+| Constructor | Mode | Query Filter |
+|-------------|------|-------------|
+| `LineItemCreatorBatch(lineItemsPerOpp)` | **Unscoped** | `WHERE Name LIKE 'BulkTest_Opp_%'` (all) |
+| `LineItemCreatorBatch(lineItemsPerOpp, startIndex, endIndex)` | **Scoped** | `WHERE Name >= :nameFrom AND Name <= :nameTo` |
+
+The scoped constructor converts integer indices to zero-padded names
+(e.g., `501` -> `BulkTest_Opp_000501`) for the range query. The invoker script
+`03_run_create_lineitems.apex` also supports scoped mode via `START_INDEX` and
+`END_INDEX` parameters.
 
 ### Scalability (No Record Limit)
 
@@ -254,14 +294,19 @@ across **multiple transactions**. Each batch execution gets its own governor lim
 Each execution: independent 10,000 DML row limit, 60s CPU, 12 MB heap
 ```
 
-For even larger volumes, adjust `START_INDEX` across multiple batch submissions:
+For even larger volumes, adjust `START_INDEX` across multiple batch submissions.
+When `chainLineItems=true`, each run automatically scopes the chained
+`LineItemCreatorBatch` to only the Opportunities created by that run (see
+[Scoped Chaining](#scoped-chaining-critical-for-multi-run-safety)):
 
 ```apex
-// Run 1: create Opps 1 - 500,000
-Database.executeBatch(new OpportunityCreatorBatch(500000, false, 1), 200);
+// Run 1: create Opps 1-500,000 + their LineItems
+Database.executeBatch(new OpportunityCreatorBatch(500000, true, 1), 200);
+// Chains to: LineItemCreatorBatch(3, 1, 500000) — only Opps 1-500K
 
-// Run 2: create Opps 500,001 - 1,000,000
-Database.executeBatch(new OpportunityCreatorBatch(500000, false, 500001), 200);
+// Run 2: create Opps 500,001-1,000,000 + their LineItems
+Database.executeBatch(new OpportunityCreatorBatch(500000, true, 500001), 200);
+// Chains to: LineItemCreatorBatch(3, 500001, 1000000) — only Opps 500K+1 to 1M
 ```
 
 ### Monitoring Batch Jobs
@@ -524,10 +569,21 @@ System.debug('Standard Pricebook activated');
 ### Phase 4: Create Line Items (Script 03)
 
 1. **Wait for Phase 3 to complete** (Opportunities must exist)
-2. Paste contents of `apex/03_create_lineitems.apex`
+2. Paste contents of `apex/03_run_create_lineitems.apex`
 3. Adjust `LINE_ITEMS_PER_OPP` at the top (default: 3)
-4. Click **Execute**
-5. Monitor batch job completion
+4. **Choose mode:**
+   - **ALL mode** (default): Leave `START_INDEX = 0` and `END_INDEX = 0` to create
+     LineItems for every BulkTest Opportunity in the org
+   - **SCOPED mode**: Set `START_INDEX` and `END_INDEX` to process only a specific
+     range (e.g., `START_INDEX = 501`, `END_INDEX = 1000`). Use this when you've
+     run multiple batches of OpportunityCreatorBatch and only want LineItems for the
+     latest batch's Opportunities.
+5. Click **Execute**
+6. Monitor batch job completion
+
+**Note**: If you used `CHAIN_LINEITEMS = true` in Script 02, LineItems were
+already created automatically (scoped to that batch's Opportunities). You only
+need Script 03 if you created Opportunities without chaining.
 
 ### Phase 5: Verify Data
 
